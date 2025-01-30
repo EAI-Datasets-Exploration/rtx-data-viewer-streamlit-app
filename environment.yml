@@ -1,0 +1,24 @@
+name: rtx-streamlit-app
+channels:
+  - defaults
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python==3.10
+  - bioconda::p7zip
+  - certifi
+  - cuda-toolkit
+  - gcsfs
+  - gsutil
+  - google-auth
+  - pandas
+  - git-lfs
+  - tensorflow-datasets
+  - regex
+  - openpyxl
+
+# Pip dependencies
+  - pip
+  - pip:
+      - streamlit 
