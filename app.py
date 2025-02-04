@@ -1,11 +1,10 @@
 import streamlit as st
-import tensorflow as tf
-import gcsfs
 import numpy as np
 from PIL import Image
 import time
 from rtxdataset import RTXDataset
 
+# Dataset Configurations
 RTX_DATASET_CONFIGS = {
     "TacoPlay": {
         "gcs_url": "gs://gresearch/robotics/taco_play/0.1.0/",
@@ -30,11 +29,11 @@ RTX_DATASET_CONFIGS = {
     },
 }
 
-# Instantiate RTXDataset objects based on the configurations
-datasets = {}
-
-for name, config in RTX_DATASET_CONFIGS.items():
-    datasets[name] = RTXDataset(
+@st.cache_resource
+def load_dataset(name):
+    """Load RTXDataset only when selected to optimize memory usage."""
+    config = RTX_DATASET_CONFIGS[name]
+    return RTXDataset(
         name=name,
         gcs_url=config["gcs_url"],
         text_key=config["text_key"],
@@ -42,10 +41,6 @@ for name, config in RTX_DATASET_CONFIGS.items():
         is_first_key=config["is_first_key"],
         is_last_key=config["is_last_key"]
     )
-
-@st.cache_resource
-def list_tfrecord_files(dataset):
-    return dataset.get_record_files()
 
 def display_episode(episode_texts, episode_images, delay=0.05):
     """Displays text and images sequentially for an episode."""
@@ -60,31 +55,46 @@ def display_episode(episode_texts, episode_images, delay=0.05):
 # Streamlit UI
 st.title("Google Robotics Dataset Viewer")
 
-# Streamlit selectbox for selecting a dataset by name
-selected_dataset_name = st.selectbox("Choose a Dataset:", list(datasets.keys()))
+# Dataset Selection
+selected_dataset_name = st.selectbox("Choose a Dataset:", list(RTX_DATASET_CONFIGS.keys()))
 
-# Retrieve the selected dataset object
-selected_dataset = datasets[selected_dataset_name]
+if selected_dataset_name:
+    selected_dataset = load_dataset(selected_dataset_name)
 
-# Select a TFRecord file
-tfrecord_files = selected_dataset.get_record_files()
-selected_tfrecord = st.selectbox("Choose a TFRecord file:", tfrecord_files)
+    # Choose Lookup Method
+    st.subheader("Find an Episode")
+    lookup_mode = st.radio("Select how to find an episode:", ["Dropdown", "Search by Episode Number"])
 
-# Display data
-if selected_tfrecord:
-    episodes = selected_dataset.parse_tfrecord(selected_tfrecord)
-    
-    st.write(f"Total Episodes Found: {len(episodes)}")
+    if lookup_mode == "Dropdown":
+        # Select a TFRecord file
+        tfrecord_files = selected_dataset.get_record_files()
+        selected_tfrecord = st.selectbox("Choose a TFRecord file:", tfrecord_files)
 
-    # Dropdown to select episode
-    episode_choices = [f"Episode {i + 1}" for i in range(len(episodes))]
-    selected_episode = st.selectbox("Select an episode", episode_choices)
+        if selected_tfrecord:
+            episodes = selected_dataset.parse_tfrecord(selected_tfrecord)
+            st.write(f"Total Episodes Found: {len(episodes)}")
 
-    # Map selected episode to its index
-    episode_idx = episode_choices.index(selected_episode)
+            # Dropdown for episode selection
+            episode_choices = [f"Episode {i + 1}" for i in range(len(episodes))]
+            selected_episode = st.selectbox("Select an episode", episode_choices)
 
-    # Display selected episode
-    episode_texts, episode_images = episodes[episode_idx]
-    st.subheader(f"{selected_episode} / Total Episodes: {len(episodes)}")
-    display_episode(episode_texts, episode_images)
+            # Get episode index
+            episode_idx = episode_choices.index(selected_episode)
+            episode_texts, episode_images = episodes[episode_idx]
 
+            st.subheader(f"Episode {episode_idx + 1} / Total Episodes: {len(episodes)}")
+            display_episode(episode_texts, episode_images)
+
+    else:
+        # **Search for an Episode by Global Index**
+        total_episodes = len(selected_dataset._episode_index_map)
+        episode_idx = st.number_input(
+            "Enter Episode Number:", min_value=1, max_value=total_episodes, step=1, value=1
+        ) - 1
+
+        if 0 <= episode_idx < total_episodes:
+            episode_texts, episode_images = selected_dataset.get_episode_by_index(episode_idx)
+            st.subheader(f"Episode {episode_idx + 1} / Total Episodes: {total_episodes}")
+            display_episode(episode_texts, episode_images)
+        else:
+            st.error("Invalid Episode Number. Please enter a valid episode index.")
