@@ -94,15 +94,48 @@ class RTXDataset:
         # Create table if it doesn't exist
         c.execute("CREATE TABLE IF NOT EXISTS episode_index (global_id INTEGER PRIMARY KEY, file_path TEXT, local_index INTEGER)")
 
+        # Create FTS5 table for text search
+        c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS episode_texts USING fts5(global_id, text)")
+
         # Clear any existing data (useful if rebuilding index)
         c.execute("DELETE FROM episode_index")
+        c.execute("DELETE FROM episode_texts")
+
+        # Insert episode index and texts
+        episode_text_entries = []
+        for global_id, (file_path, local_index) in self._episode_index_map.items():
+            c.execute("INSERT INTO episode_index VALUES (?, ?, ?)", (global_id, file_path, local_index))
+            episodes = self.parse_tfrecord(file_path)
+            episode_text = " ".join(episodes[local_index][0])
+
+            episode_text_entries.append((global_id, episode_text))
 
         # Insert new index data
-        c.executemany("INSERT INTO episode_index VALUES (?, ?, ?)", [(k, v[0], v[1]) for k, v in self._episode_index_map.items()])
+        c.executemany("INSERT INTO episode_texts VALUES (?, ?)", episode_text_entries)
 
         conn.commit()
         conn.close()
         print(f"Episode index saved to {self.db_path}")
+
+    def search_episodes_by_text(self, query):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        c.execute("SELECT global_id FROM episode_texts WHERE text MATCH ?", (query,))
+        matching_ids = [row[0] for row in c.fetchall()]
+
+        conn.close()
+
+        if not matching_ids:
+            return []
+        
+        matching_episodes = []
+        for episode_index in matching_ids:
+            record_path, local_index = self._episode_index_map[episode_index]
+            episodes = self.parse_tfrecord(record_path)
+            matching_episodes.append((episode_index, episodes[local_index]))
+        
+        return matching_episodes
 
     def load_episode_index_sqlite(self):
         """Loads the episode index from an SQLite database if it exists."""
