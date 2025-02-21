@@ -212,12 +212,12 @@ if selected_dataset_name:
                 st.write(f"Found {len(matching_episodes)} episode(s) containing '{search_query}':")
                 
                 # Dropdown to select from matching episodes
-                episode_options = [f"Episode {idx + 1}" for idx, _, _ in matching_episodes]
+                episode_options = [f"Episode {idx + 1}" for idx, _ in matching_episodes]
                 selected_match = st.selectbox("Select an episode from search results:", episode_options)
 
                 if selected_match:
                     match_idx = episode_options.index(selected_match)
-                    episode_idx, episode_texts, episode_images = matching_episodes[match_idx]
+                    episode_idx, (episode_texts, episode_images) = matching_episodes[match_idx]
                     
                     st.subheader(f"Episode {episode_idx + 1} / Total Episodes: {len(selected_dataset._episode_index_map)}")
                     display_episode(episode_texts, episode_images)
