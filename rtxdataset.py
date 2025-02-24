@@ -1,50 +1,86 @@
 import concurrent.futures
 import tensorflow as tf
-import gcsfs
 import sqlite3
 import os
+import glob
 
 class RTXDataset:
-    def __init__(self, name, gcs_url, text_key, image_key, is_first_key, is_last_key, db_path="sqlite3_files/"):
+    def __init__(self, name, local_data_path, text_key, image_key, is_first_key, is_last_key, db_path="sqlite3_files/"):
         self.name = name
-        self.gcs_url = gcs_url
+        self.local_data_path = local_data_path
         self.text_key = text_key
         self.image_key = image_key
         self.is_first_key = is_first_key
         self.is_last_key = is_last_key
-        self.db_path = db_path + self.name + "_episode_index.db"
+        self.db_path = os.path.join(db_path, f"{self.name}_episode_index.db")
 
         self.image_h = 224
         self.image_w = 224
 
         self.record_files = self.create_tfrecord_files_list()
+        self._cached_episodes = {}
 
-        # Try to load from SQLite, otherwise build and cache the index
         if self._episode_index_exists():
             self._episode_index_map = self.load_episode_index_sqlite()
         else:
+            print("🛠 Building episode index...")
             self._episode_index_map = self._build_episode_index_parallel()
             self.save_episode_index_sqlite()
 
+    def _episode_index_exists(self):
+        """Checks if the SQLite database contains an episode index."""
+        if not os.path.exists(self.db_path):
+            return False
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='episode_index'")
+        table_exists = c.fetchone()[0] > 0
+
+        if table_exists:
+            c.execute("SELECT COUNT(*) FROM episode_index")
+            row_count = c.fetchone()[0]
+        else:
+            row_count = 0
+
+        conn.close()
+        return row_count > 0
+
     def create_tfrecord_files_list(self):
-        """List all TFRecord files from the given GCS bucket."""
-        fs = gcsfs.GCSFileSystem()
-        files = fs.ls(self.gcs_url)
-        return [f"gs://{file}" for file in files if "tfrecord" in file]
-    
+        """Lists all files containing 'tfrecord' in their filename in the specified local directory."""
+        all_files = glob.glob(os.path.join(self.local_data_path, "**/*"), recursive=True)  # Recursively list all files
+        tfrecord_files = [file for file in all_files if "tfrecord" in os.path.basename(file)]  # Filter for 'tfrecord'
+
+        if not tfrecord_files:
+            print(f"❌ ERROR: No TFRecord files found in {self.local_data_path}. Check dataset path.")
+        else:
+            print(f"✅ Found {len(tfrecord_files)} TFRecord files in {self.local_data_path}")
+        
+        return tfrecord_files
+
     def get_record_files(self):
         return self.record_files
 
     def parse_tfrecord(self, record_path):
         """Parses a single TFRecord file and returns a list of episodes."""
+
+        print(f"record path in parse_tfrecord(): {record_path}")
+
         raw_dataset = tf.data.TFRecordDataset(record_path)
         episodes = []
         current_texts = []
         current_images = []
 
+        print(f"🔍 Parsing TFRecord: {record_path}")
+
         for raw_record in raw_dataset:
             example = tf.train.Example()
             example.ParseFromString(raw_record.numpy())
+
+            if self.text_key not in example.features.feature or self.image_key not in example.features.feature:
+                print(f"❌ ERROR: Required keys {self.text_key}, {self.image_key} not found in {record_path}.")
+                return []
 
             is_first = bool(example.features.feature[self.is_first_key].int64_list.value[0])
             is_last = bool(example.features.feature[self.is_last_key].int64_list.value[0])
@@ -64,15 +100,11 @@ class RTXDataset:
                 episodes.append((current_texts, current_images))
                 current_texts, current_images = [], []
 
+        print(f"📊 Total Episodes Parsed: {len(episodes)} from {record_path}")
         return episodes
 
-    def _process_file_for_index(self, record_file):
-        """Helper function to process a single TFRecord file for episode indexing."""
-        episodes = self.parse_tfrecord(record_file)
-        return [(record_file, i) for i in range(len(episodes))]
-
     def _build_episode_index_parallel(self):
-        """Builds a mapping from global episode indices to (TFRecord file, local episode index) using parallel processing."""
+        """Builds the episode index using parallel processing."""
         episode_index_map = {}
         episode_count = 0
 
@@ -81,100 +113,120 @@ class RTXDataset:
 
         for episodes_in_file in results:
             for local_idx in episodes_in_file:
-                episode_index_map[episode_count] = local_idx
+                episode_index_map[episode_count] = (local_idx[0], local_idx[1], local_idx[2])
                 episode_count += 1
 
+        if not episode_index_map:
+            print("❌ ERROR: No episodes indexed. Check TFRecord parsing.")
         return episode_index_map
 
+    def _process_file_for_index(self, record_file):
+        """Processes a single TFRecord file and returns metadata for indexing."""
+        episodes = self.parse_tfrecord(record_file)
+        return [(record_file, i, " ".join(episodes[i][0])) for i in range(len(episodes))]
+
     def save_episode_index_sqlite(self):
-        """Saves the episode index to an SQLite database."""
+        """Saves the episode index and text data to an SQLite database."""
+        if not self._episode_index_map:
+            print("❌ ERROR: No episodes found in index. Ensure TFRecord files are correctly parsed.")
+            return
+
+        print(f"🛠 Creating SQLite DB at: {self.db_path}")
+
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
-        # Create table if it doesn't exist
-        c.execute("CREATE TABLE IF NOT EXISTS episode_index (global_id INTEGER PRIMARY KEY, file_path TEXT, local_index INTEGER)")
+        # Create episode index table
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS episode_index (
+                global_id INTEGER PRIMARY KEY,
+                file_path TEXT,
+                local_index INTEGER,
+                text TEXT
+            )
+        """)
 
-        # Create FTS5 table for text search
+        # Create full-text search table
         c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS episode_texts USING fts5(global_id, text)")
 
-        # Clear any existing data (useful if rebuilding index)
+        # Clear old data
         c.execute("DELETE FROM episode_index")
         c.execute("DELETE FROM episode_texts")
 
-        # Insert episode index and texts
-        episode_text_entries = []
-        for global_id, (file_path, local_index) in self._episode_index_map.items():
-            c.execute("INSERT INTO episode_index VALUES (?, ?, ?)", (global_id, file_path, local_index))
-            episodes = self.parse_tfrecord(file_path)
-            episode_text = " ".join(episodes[local_index][0])
+        episode_entries = []
+        text_entries = []
 
-            episode_text_entries.append((global_id, episode_text))
+        for global_id, (file_path, local_index, episode_text) in self._episode_index_map.items():
+            print(f"📌 Storing Episode {global_id}: {episode_text[:100]}...")  # Debugging
+            episode_entries.append((global_id, file_path, local_index, episode_text))
+            text_entries.append((global_id, episode_text))
 
-        # Insert new index data
-        c.executemany("INSERT INTO episode_texts VALUES (?, ?)", episode_text_entries)
+        if not episode_entries:
+            print("❌ ERROR: No data to insert into SQLite!")
+            conn.close()
+            return
 
-        conn.commit()
-        conn.close()
-        print(f"Episode index saved to {self.db_path}")
+        try:
+            c.executemany("INSERT INTO episode_index VALUES (?, ?, ?, ?)", episode_entries)
+            c.executemany("INSERT INTO episode_texts VALUES (?, ?)", text_entries)
+            conn.commit()
+            print(f"✅ SQLite DB successfully created: {self.db_path} with {len(episode_entries)} episodes")
+        except Exception as e:
+            print(f"❌ SQLite Insert Error: {e}")
+        finally:
+            conn.close()
 
-    def search_episodes_by_text(self, query):
+    def load_episode_index_sqlite(self):
+        """Loads the episode index from SQLite."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
+        c.execute("SELECT global_id, file_path, local_index, text FROM episode_index")
+        rows = c.fetchall()
+        conn.close()
+
+        if rows:
+            print(f"✅ Loaded {len(rows)} episodes from {self.db_path}")
+        else:
+            print(f"❌ ERROR: SQLite database is empty!")
+
+        return {row[0]: (row[1], row[2], row[3]) for row in rows}
+
+    def search_episodes_by_text(self, query):
+        """Search for episodes containing the given text."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        # Using FTS5 full-text search
         c.execute("SELECT global_id FROM episode_texts WHERE text MATCH ?", (query,))
         matching_ids = [row[0] for row in c.fetchall()]
 
         conn.close()
 
         if not matching_ids:
+            print(f"❌ No episodes found for query: {query}")
             return []
-        
+
         matching_episodes = []
         for episode_index in matching_ids:
-            record_path, local_index = self._episode_index_map[episode_index]
-            episodes = self.parse_tfrecord(record_path)
-            matching_episodes.append((episode_index, episodes[local_index]))
-        
+            if episode_index in self._cached_episodes:
+                matching_episodes.append((episode_index, self._cached_episodes[episode_index]))
+            else:
+                record_path, local_index, _ = self._episode_index_map[episode_index]
+                episodes = self.parse_tfrecord(record_path)
+                episode_data = (episodes[local_index][0], episodes[local_index][1])
+
+                # Cache for faster future retrieval
+                self._cached_episodes[episode_index] = episode_data
+                matching_episodes.append((episode_index, episode_data))
+
         return matching_episodes
 
-    def load_episode_index_sqlite(self):
-        """Loads the episode index from an SQLite database if it exists."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-
-        c.execute("SELECT global_id, file_path, local_index FROM episode_index")
-        rows = c.fetchall()
-
-        conn.close()
-        print(f"Loaded episode index from {self.db_path}")
-
-        return {row[0]: (row[1], row[2]) for row in rows}
-
-    def _episode_index_exists(self):
-        """Checks if an episode index exists in the SQLite database."""
-        if not os.path.exists(self.db_path):
-            return False
-
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-
-        c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='episode_index'")
-        table_exists = c.fetchone()[0] > 0
-
-        if table_exists:
-            c.execute("SELECT COUNT(*) FROM episode_index")
-            row_count = c.fetchone()[0]
-        else:
-            row_count = 0
-
-        conn.close()
-
-        return row_count > 0  # True if episodes are stored
 
     def get_episode_by_index(self, episode_index):
-        """Retrieves an episode using its global index across all TFRecords."""
+        """Retrieves an episode using its global index."""
         if episode_index in self._episode_index_map:
-            record_path, local_index = self._episode_index_map[episode_index]
+            record_path, local_index, _ = self._episode_index_map[episode_index]  # FIXED: Unpacking 3 values
             episodes = self.parse_tfrecord(record_path)
             return episodes[local_index]
         else:
